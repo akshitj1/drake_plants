@@ -1,0 +1,7 @@
+workspace(name="foo_bazel_installed")
+
+new_local_repository(
+  name = "drake",
+  path = "/Volumes/meet/drake", # path to downloaded unzipped binary
+  build_file = "drake.BUILD",
+)
