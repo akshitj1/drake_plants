@@ -7,8 +7,8 @@ This uses the CMake `find_package(drake)` mechanism to find an installed instanc
 Perching Glider with Direct Collocation: ["Robust Post-Stall Perching with a Simple Fixed-Wing Glider using LQR-Trees"](https://groups.csail.mit.edu/robotics-center/public_papers/Moore14a.pdf) - J.Moore et. al.
 
 ## TODO:
-..* LQR tree for Perching Glider
-..* 2D tailsitter plant
+* LQR tree for Perching Glider
+* 2D tailsitter plant
 
 # Instructions
 
