@@ -9,6 +9,8 @@
 #include "limits"
 #include "drake/manipulation/util/trajectory_utils.h"
 #include "drake/systems/primitives/trajectory_source.h"
+#include "drake/systems/primitives/adder.h"
+#include "drake/systems/controllers/linear_model_predictive_controller.h"
 
 // taken from : https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/runDircolPerching.m
 
@@ -19,7 +21,7 @@ namespace drake {
             typedef trajectories::PiecewisePolynomial<double> PPoly;
             namespace {
 
-                int do_main() {
+                int run_dircol() {
                     systems::DiagramBuilder<double> builder;
                     auto glider = std::make_unique<Glider<double>>();
                     //Glider<double> glider;
@@ -111,16 +113,87 @@ namespace drake {
 
                     return 0;
                 }
+
+                // taken from: https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/runLQR.m
+                // and https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/GliderLQR.m
+                int run_lqr(){
+                    // u_traj and x_traj should be avail.
+                    systems::DiagramBuilder<double> builder;
+                    auto glider = std::make_unique<Glider<double>>();
+                    //Glider<double> glider;
+                    glider->set_name("glider");
+                    auto context = glider->CreateDefaultContext();
+
+                    VectorX<double> qf(7);
+                    qf << 1/0.0025, 1/0.0025, 1/9, 1/9, 1, 1, 1/9;
+                    Eigen::MatrixXd<double> Qf = qf.asDiagonal();
+
+                    VectorX<double> q(7);
+                    q << 10,10,10,1,1,1,1;
+                    Eigen::MatrixXd Q(7,7);
+                    Q = q.asDiagonal();
+                    Eigen::MatrixXd R(1,1);
+                    R << 0.1;
+                    const double timePeriod = 0.01, timeHorizon = 1;
+                    systems::controllers::LinearModelPredictiveController<double> lmpc(glider.get(),*context, Q, R, timePeriod, timeHorizon);
+                    auto controller = builder.AddSystem(lmpc);
+                }
             }
 
         }
     }
 }
 
+namespace drake{
+    namespace systems{
+        namespace controllers{
+            /// The return type of ConnectController.
+            template <typename T>
+            struct ConnectResult {
+                /// The feed forward control input.
+                const InputPort<T>& control_input_port;
+                /// The feedback state input.
+                const InputPort<T>& state_input_port;
+            };
+
+            template <typename T>
+            static ConnectResult<T> ConnectController(
+                    const InputPort<T>& plant_input,
+                    const OutputPort<T>& plant_output,
+                    const MatrixX<double>& feedback_selector, const Eigen::VectorXd& Kp,
+                    const Eigen::VectorXd& Ki, const Eigen::VectorXd& Kd,
+                    DiagramBuilder<T>* builder) {
+                auto controller = builder->template AddSystem<PidController<T>>(
+                        feedback_selector,
+                                Kp, Ki, Kd);
+
+                auto plant_input_adder =
+                builder->template AddSystem<Adder<T>>(2, plant_input.size());
+
+                builder->Connect(plant_output, controller->get_input_port_estimated_state());
+                builder->Connect(controller->get_output_port_control(),
+                                 plant_input_adder->get_input_port(0));
+                builder->Connect(plant_input_adder->get_output_port(), plant_input);
+
+                return ConnectResult<T>{
+                        plant_input_adder->get_input_port(1),
+                        controller->get_input_port_desired_state()};
+            }
+
+            }
+
+    }
+}
+
+
+
+
+
+
 int main(int argc, char *argv[]) {
     gflags::SetUsageMessage(
             "Trajectory optimization for perching glider.");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     drake::logging::HandleSpdlogGflags();
-    return drake::examples::glider::do_main();
+    return drake::examples::glider::run_dircol();
 }
