@@ -11,6 +11,9 @@
 #include "drake/systems/primitives/trajectory_source.h"
 #include "drake/systems/primitives/adder.h"
 #include "drake/systems/controllers/linear_model_predictive_controller.h"
+#include "tvlqr.h"
+#include "iostream"
+#include "fstream"
 
 // taken from : https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/runDircolPerching.m
 
@@ -19,9 +22,23 @@ namespace drake {
     namespace examples {
         namespace glider {
             typedef trajectories::PiecewisePolynomial<double> PPoly;
-            namespace {
+            typedef std::pair<PPoly, PPoly> TrajPair;
 
-                int run_dircol() {
+            namespace {
+                template <typename T>
+                void dump(T& obj, const std::string& fname);
+
+                template <typename T>
+                bool load(T& obj, const std::string& fname);
+
+                void lqr_stabilize(const Glider<double>* glider, const systems::Context<double>& context, PPoly x_des, PPoly u_des);
+
+                void run_dircol(TrajPair& trajs, bool force_refresh=false) {
+                    const std::string traj_file_name = "trajs.bin";
+                    //auto trajs = std::make_unique<TrajPair>();
+                    if(!force_refresh && load(trajs,traj_file_name))
+                        return;
+
                     systems::DiagramBuilder<double> builder;
                     auto glider = std::make_unique<Glider<double>>();
                     //Glider<double> glider;
@@ -98,25 +115,69 @@ namespace drake {
                     const auto result = solvers::Solve(dircol);
 
                     if (!result.is_success()) {
-                        std::cerr << result.get_solver_id()
-                                  << " Failed to solve optimization for the perching trajectory"
-                                  << std::endl;
-                        return 1;
+                        throw result.get_solver_id().name()
+                                  + " Failed to solve optimization for the perching trajectory";
                     }
 
-                    const PPoly pp_xtraj = dircol.ReconstructStateTrajectory(result);
+                    PPoly x_des = dircol.ReconstructStateTrajectory(result);
+                    PPoly u_des = dircol.ReconstructInputTrajectory(result);
+
+                    lqr_stabilize(glider.get(), *context, x_des, u_des);
+
+                    dump(trajs, traj_file_name);
+                    std::cout<<"trajectories dumped to file: "<<traj_file_name<<std::endl;
+
+
+
+                    //return trajs;
+/*                    PPoly* x_des = &trajs.first;
+
                     //drake::manipulation::PiecewiseCubicTrajectory<double> pc_traj(pp_xtraj);
-                    for(auto time: pp_xtraj.get_segment_times()){
-                        auto _state = pp_xtraj.value(time);
-                        std::cout<<time<<"\t"<<_state(0)<<"\t"<<_state(1)<<std::endl;
-                    }
+                    for(auto time: x_des->get_segment_times()){
+                        auto x = x_des->value(time);
+                        std::cerr<<x_des->get_segment_index(time)<<"\t"<<time<<"\t"<<x(0)<<"\t"<<x(1)<<std::endl;
+                    }*/
 
-                    return 0;
+                }
+
+                template <typename T>
+                void dump(T& obj, const std::string& fname){
+                    std::ofstream file(fname, std::ios::out | std::ios::binary);
+                    file.write((char*)&obj, sizeof(obj));
+                    file.close();
+                }
+
+                // returns fileExists?
+                template <typename T>
+                bool load(T& obj, const std::string& fname){
+                    std::ifstream file(fname, std::ios::in | std::ios::binary);
+                    if(!file.is_open())
+                        return false;
+                    std::cout<<"read "<< sizeof(T)<<" chars"<<std::endl;
+                    file.read((char*)&obj, sizeof(obj));
+                    file.close();
+                    return true;
+                }
+                void lqr_stabilize(const Glider<double>* glider, const systems::Context<double>& context,const PPoly& x_des,const PPoly& u_des){
+                    VectorX<double> qf(7);
+                    qf << 1/0.0025, 1/0.0025, 1/9.0, 1/9.0, 1, 1, 1/9.0;
+                    MatrixX<double> Qf = qf.asDiagonal();
+
+                    VectorX<double> q(7);
+                    q << 10,10,10,1,1,1,1;
+                    Eigen::MatrixXd Q(7,7);
+                    Q = q.asDiagonal();
+                    Eigen::MatrixXd R(1,1);
+                    R << 0.1;
+
+                    auto tvlqr = systems::controllers::TimeVaryingLQR(*glider, context, x_des, u_des, Q, R, Qf);
+                    tvlqr.CalcControl();
+                    return;
                 }
 
                 // taken from: https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/runLQR.m
                 // and https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/GliderLQR.m
-                int run_lqr(){
+/*                int run_lqr(){
                     // u_traj and x_traj should be avail.
                     systems::DiagramBuilder<double> builder;
                     auto glider = std::make_unique<Glider<double>>();
@@ -125,8 +186,8 @@ namespace drake {
                     auto context = glider->CreateDefaultContext();
 
                     VectorX<double> qf(7);
-                    qf << 1/0.0025, 1/0.0025, 1/9, 1/9, 1, 1, 1/9;
-                    Eigen::MatrixXd<double> Qf = qf.asDiagonal();
+                    qf << 1/0.0025, 1/0.0025, 1/9.0, 1/9.0, 1, 1, 1/9.0;
+                    MatrixX<double> Qf = qf.asDiagonal();
 
                     VectorX<double> q(7);
                     q << 10,10,10,1,1,1,1;
@@ -137,13 +198,14 @@ namespace drake {
                     const double timePeriod = 0.01, timeHorizon = 1;
                     systems::controllers::LinearModelPredictiveController<double> lmpc(glider.get(),*context, Q, R, timePeriod, timeHorizon);
                     auto controller = builder.AddSystem(lmpc);
-                }
+                }*/
             }
 
         }
     }
 }
 
+/*
 namespace drake{
     namespace systems{
         namespace controllers{
@@ -184,10 +246,7 @@ namespace drake{
 
     }
 }
-
-
-
-
+*/
 
 
 int main(int argc, char *argv[]) {
@@ -195,5 +254,8 @@ int main(int argc, char *argv[]) {
             "Trajectory optimization for perching glider.");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     drake::logging::HandleSpdlogGflags();
-    return drake::examples::glider::run_dircol();
+    drake::examples::glider::TrajPair trajs;
+    drake::examples::glider::run_dircol(trajs, true);
+//    drake::examples::glider::run_dircol(trajs);
+    return 0;
 }
