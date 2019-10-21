@@ -79,7 +79,6 @@ namespace drake{ namespace examples{ namespace glider{
             auto acc = (F_w + F_e + kF_g)/kMass;
             T theta_ddot = (Vector2<T>(kLw, 0).dot(F_w)
                     + Vector2<T>(-kL - kLe * cos(theta),-kL + kLe * sin(theta)).dot(F_e)) / kInertia;
-
 */
             VectorX<T> q_dot(7);
             //q_dot << xdot[0], xdot[1], thetadot, phidot, acc[0], acc[1], theta_ddot;

@@ -9,17 +9,18 @@
 #include "drake/systems/analysis/initial_value_problem-inl.h"
 #include "drake/math/autodiff.h"
 #include "drake/math/autodiff_gradient.h"
+#include "drake/systems/primitives/linear_system.h"
+#include "drake/systems/controllers/state_feedback_controller_interface.h"
+#include "drake/systems/framework/leaf_system.h"
+#include "drake/common/default_scalars.h"
+
+
 
 namespace drake {
     namespace systems {
         namespace controllers {
-            /* helper functions */
             template <typename T>
-            int sgn(T val) {
-                return (T(0) < val) - (val < T(0));
-            }
-
-            typedef trajectories::PiecewisePolynomial<double> PPoly;
+            using PPoly = trajectories::PiecewisePolynomial<T>;
             /*
              * ref:
              * https://github.com/RobotLocomotion/drake/issues/9013
@@ -27,268 +28,210 @@ namespace drake {
              * https://github.com/RobotLocomotion/drake/tree/last_sha_with_original_matlab/drake/examples/Glider
              * http://underactuated.csail.mit.edu/underactuated.html?chapter=lqr
              */
-            class TimeVaryingLQR {
+
+            // util functions
+            template <typename T>
+            static std::unique_ptr<AffineSystem<T>> Linearize(const System<T> &system,
+                                                                   const VectorX<T> &x0,
+                                                                   const VectorX<T> &u0) {
+                auto lin_context = system.CreateDefaultContext();
+                // todo: set time too?
+                lin_context->SetContinuousState(x0);
+                lin_context->FixInputPort(0, u0);
+                auto affine_system = FirstOrderTaylorApproximation(system, *lin_context,
+                                                                   InputPortSelection::kUseFirstInputIfItExists,
+                                                                   OutputPortSelection::kNoOutput);
+                return affine_system;
+            }
+
+            template <typename T>
+            static MatrixX<double> unravel(VectorX<T> &x, const int kDim) {
+                MatrixX<T> X(kDim, kDim);
+                // kDim can be derived from x.size() also as square
+                X << Eigen::Map<MatrixX<T>>(x.data(), kDim, kDim);
+                return X;
+            }
+
+            template <typename T>
+            static VectorX<double> ravel(MatrixX<T> &X) {
+                return Eigen::Map<VectorX<T>>(X.data(), X.size());
+            }
+
+
+            template<typename T>
+            class TimeVaryingLQR final : public LeafSystem<T> {
+            public:
+                DRAKE_NO_COPY_NO_MOVE_NO_ASSIGN(TimeVaryingLQR);
+
             private:
-                const Eigen::MatrixXd& Q, Qf, R;
-                const System<double>& system;
-                const Context<double>& context;
-                const PPoly& x_des, u_des;
+                const MatrixX<T> &Q, Qf, R;
+                const System<T> &system;
+                const PPoly<T>& x_des;
+                const PPoly<T>& u_des;
                 const int kNumStates, kNumInputs;
                 const double kTimeSpan;
 
+                int input_index_state_{-1};
+                int output_index_control_{-1};
+
                 std::unique_ptr<DenseOutput<double>> s_traj;
             public:
-
                 TimeVaryingLQR(
-                        const System<double>& _system,
-                        const drake::systems::Context<double>& context,
-                        const PPoly& _x_des,
-                        const PPoly& _u_des,
-                        const Eigen::MatrixXd& _Q,
-                        const Eigen::MatrixXd& _R,
-                        const Eigen::MatrixXd& _Qf):
-                        system(_system), context(context), Q(_Q), Qf(_Qf), R(_R), x_des(_x_des), u_des(_u_des), kTimeSpan(_x_des.end_time()), kNumStates(_Q.rows()), kNumInputs(_R.rows()){
-                    // Descrption of the linearized plant model.
-                    //std::unique_ptr<LinearSystem<double>> linear_model_ = Linearize(model, base_context);
+                        const System<T> &_system,
+                        const PPoly<T> &_x_des,
+                        const PPoly<T> &_u_des,
+                        const MatrixX<T> &_Q,
+                        const MatrixX<T> &_R,
+                        const MatrixX<T> &_Qf) :
+                        LeafSystem<T>(SystemTypeTag<TimeVaryingLQR>{}),
+                                      system(_system), Q(_Q), Qf(_Qf), R(_R), x_des(_x_des),
+                                      u_des(_u_des),
+                                      kTimeSpan(_x_des.end_time()), kNumStates(_Q.rows()), kNumInputs(_R.rows()) {
 
-                    Eigen::LLT<Eigen::MatrixXd> R_cholesky(R);
+                    Eigen::LLT<MatrixX<T>> R_cholesky(R);
                     if (R_cholesky.info() != Eigen::Success) {
                         throw std::runtime_error("R must be positive definite");
                     }
                     // todo: check needs for Q too?
+
+                    //this->DeclareContinuousState(kNumInputs);
+
+                    output_index_control_ = this->DeclareVectorOutputPort(
+                            BasicVector<T>(kNumInputs),
+                            &TimeVaryingLQR<T>::CalcControl
+                    ).get_index();
+
+                    input_index_state_ = this->DeclareInputPort(kVectorValued, kNumStates).get_index();
+
+                    computeSTrajectory();
                 }
 
+/*
+                template <typename U>
+                TimeVaryingLQR(const TimeVaryingLQR<U>& other)
+                        : TimeVaryingLQR(other.system, other.x_des, other.u_des, other.Q, other.R, other.Qf) {}
+*/
 
-                VectorX<double> GetControl(const double& t){
-                    MatrixX<double> S2(kNumStates, kNumStates);
-                    VectorX<double> s1(kNumStates);
-                    const double rev_t = revTime(t);
-                    VectorX<double> s = s_traj->Evaluate(rev_t);
-                    sDynamicsOde<double>::unflattenXtoS(s, kNumStates, S2, s1);
 
-                    auto u0 = u_des.value(t);
-                    auto x0 = x_des.value(t);
-
-                    auto affine_system = sDynamicsOde<double>::Linearize(system, context, x0, u0);
-
-                    VectorX<double> u_opt = u0 - R.inverse() * affine_system->B().transpose() * (S2 * x0 + 0.5 * s1);
-                    return u_opt;
+                /**
+                 * Returns the output port for computed control.
+                 */
+                const OutputPort<T> &get_output_port() const {
+                    return System<T>::get_output_port(output_index_control_);
                 }
 
-                void debugRes(){
-                    const double kTimeStep = kTimeSpan/20;
-                    for(double t=0; t <= kTimeSpan;t+=kTimeStep){
-                        VectorX<double> u_des_t = u_des.value(t);
-                        VectorX<double> u_corr_t = GetControl(t);
-                        std::cout<<t<<"\t"<<u_des_t<<"\t"<<u_corr_t<<std::endl;
-                    };
+                /**
+                 * Returns the input port for the estimated state.
+                 */
+                const InputPort<T>& get_input_port() const {
+                    return System<T>::get_input_port(input_index_state_);
                 }
 
-            private:
-                double revTime(const double& t){
+                void DoCalcTimeDerivatives(const systems::Context<T>& context,
+                                           systems::ContinuousState<T> *derivatives) const override {}
+
+
+                    private:
+                T revTime(const T& t) const{
                     return revTime(t, kTimeSpan);
                 }
 
-                static double revTime(const double& t, const double& kTimeSpan){
-                    return std::max(0.0, kTimeSpan - t);
+                static T revTime(const T& t, const T& kTimeSpan) {
+                    return std::max<T>(0.0, kTimeSpan - t);
                 }
 
-            public:
-                VectorX<double> CalcControl(){
-                    // PPoly xdot_traj = x_des.derivative();
-                    MatrixX<double> S2_f = Qf;
-                    VectorX<double> s1_f = -2 * Qf * x_des.value(kTimeSpan);
-                    VectorX<double> kDefaultInitialState(S2_f.size()+s1_f.size());
-                    sDynamicsOde<double>::flattenStoX(S2_f, s1_f, kDefaultInitialState);
 
-                    const double kDefaultInitialTime = 0;
-                    VectorX<double> kDefaultParams(0);
-                    InitialValueProblem<double>::SpecifiedValues kDefaultValues(
+            public:
+                void CalcControl(const Context<T> &context,
+                                                   BasicVector<T> *control) const {
+                    const Eigen::VectorBlock<const VectorX<T>> x = get_input_port().Eval(context);
+                    const T& t = context.get_time();
+                    const VectorX<T> x0 = x_des.value(t);
+                    // State error.
+                    const VectorX<T> x_bar = x - x0;
+
+                    const T rev_t = this->revTime(t);
+                    VectorX<double> s = s_traj->Evaluate(rev_t);
+                    MatrixX<double> S = unravel(s, kNumStates);
+
+                    auto affine_system = Linearize<T>(system, x_des.value(t), u_des.value(t));
+
+                    VectorX<double> u_delta = -R.inverse() * affine_system->B().transpose() * S * x_bar;
+
+                    control->SetFromVector(u_des.value(t) + u_delta);
+                }
+                private:
+
+                void computeSTrajectory() {
+                    // PPoly xdot_traj = x_des.derivative();
+                    MatrixX<T> S_f = Qf;
+                    VectorX<T> kDefaultInitialState = ravel(S_f);
+                    const T kDefaultInitialTime = 0.0;
+                    VectorX<T> kDefaultParams(0);
+
+                    // todo: why typename?
+                    const typename InitialValueProblem<T>::SpecifiedValues kDefaultValues(
                             kDefaultInitialTime, kDefaultInitialState, kDefaultParams
                     );
 
-                    InitialValueProblem<double> ivp(sDynamicsOde<double>(system, context, Q, R, x_des, u_des), kDefaultValues);
+                    InitialValueProblem<T> ivp(sDot(system, Q, R, x_des, u_des), kDefaultValues);
                     //VectorX<double> s_cur = ivp.Solve(kTimeSpan);
                     s_traj = ivp.DenseSolve(kTimeSpan);
-                    debugRes();
-                    VectorX<double> s_cur = s_traj->Evaluate(kTimeSpan);
-                    return s_cur;
+                    //debugRes();
                 }
 
             private:
 
-                template<typename T>
-                class sDynamicsOde {
+                class sDot {
                 private:
-                    const MatrixX<double> &Q, R;
-                    const System<double>& system;
-                    const Context<double>& context;
-                    const PPoly &x_des, u_des;
+                    const MatrixX<T> &Q, R;
+                    const System<T> &system;
+                    const PPoly<T> &x_des, u_des;
                     const int kNumStates;
                     const double kTimeSpan;
 
                 public:
-                    sDynamicsOde(
-                            const System<double>& system,
-                            const Context<double>& context,
-                            const MatrixX<double> &Q,
-                            const MatrixX<double> &R,
-                            const PPoly &x_des,
-                            const PPoly &u_des) :
-                            system(system), context(context), Q(Q), R(R), kNumStates(Q.cols()), x_des(x_des), u_des(u_des), kTimeSpan(x_des.end_time())  {
+                    sDot(
+                            const System<T> &system,
+                            const MatrixX<T> &Q,
+                            const MatrixX<T> &R,
+                            const PPoly<T> &x_des,
+                            const PPoly<T> &u_des) :
+                            system(system), Q(Q), R(R), kNumStates(Q.cols()), x_des(x_des), u_des(u_des),
+                            kTimeSpan(x_des.end_time()) {
                     }
 
-                    VectorX<T> operator()(const T &t,const VectorX<T> &_s, const VectorX<T> &k) const {
+                    VectorX<T> operator()(const T &t, const VectorX<T> &_s, const VectorX<T> &k) const {
                         unused(k);
 
                         VectorX<T> s(_s);
                         // we do not need to solve for S_0 as u* is independent of it
-                        MatrixX<double> S2(kNumStates, kNumStates), S2_dot(kNumStates, kNumStates);
-                        VectorX<double> s1(kNumStates), s1_dot(kNumStates);
-                        unflattenXtoS(s, kNumStates, S2, s1);
+                        MatrixX<T> S(kNumStates, kNumStates), Sdot(kNumStates, kNumStates);
+                        S = unravel(s, kNumStates);
 
                         // we have to reverse the desired trajectory to use ivp by converting backward integration to forward in time
-                        // todo: ideally reverse the trajectory itself, as top level handling is more gracefull
+                        // todo: ideally reverse the trajectory itself, as top level handling is more graceful
                         const double rev_t = TimeVaryingLQR::revTime(t, kTimeSpan);
-                        const VectorX<double> x_des_t = x_des.value(rev_t);
-                        const VectorX<double> u_des_t = u_des.value(rev_t);
 
-                        auto linear_system = Linearize(static_cast<double>(rev_t));
-                        // negate system derivatives
-                        const MatrixX<double> A = linear_system->A();
-                        const MatrixX<double> B = linear_system->B();
-                        const MatrixX<double> Ri = R.inverse();
+                        auto affine_system = Linearize<T>(system, x_des.value(rev_t), u_des.value(rev_t));
+
+                        const MatrixX<T> A = affine_system->A();
+                        const MatrixX<T> B = affine_system->B();
+                        const MatrixX<T> Ri = R.inverse();
 
                         // todo: handle sign
-                        S2_dot = 1.0 * (Q - S2 * B * Ri * B.transpose() * S2 + S2*A + A.transpose() * S2);
-                        s1_dot = 1.0 * (-2 * Q * x_des_t +
-                                (A.transpose() - S2 * B * Ri * B.transpose()) * s1 +
-                                  2 * S2 * B * u_des_t);
-                        VectorX<double> s_dot(s.size());
-                        flattenStoX(S2_dot, s1_dot, s_dot);
-                        //x_dot << Eigen::Map<VectorX<double>>(S2_dot.data(), S2_dot.size()), s1_dot;
-                        // to enable backward integration we are reversing sign of time. hence reversing sign of derivative
-                        return s_dot;
+                        Sdot = S * A + A.transpose() * S - S * B * Ri * B.transpose() * S + Q;
+                        VectorX<T> sdot = ravel(Sdot);
+                        return sdot;
                     }
-                public:
-                    static void unflattenXtoS(VectorX<T> &x, const int kNumStates, MatrixX<double>& S2, VectorX<double>& s1){
-                        // matrix is built column by column
-                        S2 = Eigen::Map<Eigen::MatrixXd>(x.data(), kNumStates, kNumStates);
-                        s1 = x.tail(kNumStates);
-                    }
-
-                    static void flattenStoX(MatrixX<double>& S2, const VectorX<double>& s1, VectorX<double>& x){
-                        // todo: map not taking const!!! check if altering original matrix
-                        // map flattens in column major format ie. column by column
-                        x << Eigen::Map<Eigen::VectorXd>(S2.data(), S2.size()), s1;
-                    }
-
-                    static std::unique_ptr<AffineSystem<double>> Linearize(
-                            const System<double>& system,
-                            const Context<double>& context,
-                            const Eigen::VectorXd& x0,
-                            const Eigen::VectorXd& u0,
-                            variant<InputPortSelection, InputPortIndex> input_port_index = InputPortSelection::kUseFirstInputIfItExists,
-                            variant<OutputPortSelection, OutputPortIndex> output_port_index = OutputPortSelection::kUseFirstOutputIfItExists
-                    ){
-                        // Create an autodiff version of the system.
-                        std::unique_ptr<System<AutoDiffXd>> autodiff_system =
-                                drake::systems::System<double>::ToAutoDiffXd(system);
-
-                        // Initialize autodiff.
-                        std::unique_ptr<Context<AutoDiffXd>> autodiff_context =
-                                autodiff_system->CreateDefaultContext();
-                        autodiff_context->SetTimeStateAndParametersFrom(context);
-                        autodiff_system->FixInputPortsFrom(system, context, autodiff_context.get());
-
-                        const InputPort<AutoDiffXd>* input_port =
-                                autodiff_system->get_input_port_selection(input_port_index);
-                        const OutputPort<AutoDiffXd>* output_port =
-                                autodiff_system->get_output_port_selection(output_port_index);
-
-                        // Verify that the input port is not abstract valued.
-                        if (input_port &&
-                            input_port->get_data_type() == PortDataType::kAbstractValued) {
-                            throw std::logic_error(
-                                    "Port requested for differentiation is abstract, and differentiation "
-                                    "of abstract ports is not supported.");
-                        }
-
-                        const int num_inputs = input_port->size();
-                        const int num_outputs = output_port->size();
-
-                        const int num_states = x0.size();
-
-                        auto autodiff_args = math::initializeAutoDiffTuple(x0, u0);
-
-                        auto input_vector = std::make_unique<BasicVector<AutoDiffXd>>(num_inputs);
-                        input_vector->SetFromVector(std::get<1>(autodiff_args));
-                        autodiff_context->FixInputPort(input_port->get_index(),
-                                                       std::move(input_vector));
-
-                        Eigen::MatrixXd A(num_states, num_states), B(num_states, num_inputs);
-                        Eigen::VectorXd f0(num_states);
-
-                        autodiff_context->get_mutable_continuous_state_vector().SetFromVector(
-                                std::get<0>(autodiff_args));
-                        std::unique_ptr<ContinuousState<AutoDiffXd>> autodiff_xdot =
-                                autodiff_system->AllocateTimeDerivatives();
-                        autodiff_system->CalcTimeDerivatives(*autodiff_context,
-                                                             autodiff_xdot.get());
-                        auto autodiff_xdot_vec = autodiff_xdot->CopyToVector();
-
-                        const Eigen::MatrixXd AB =
-                                math::autoDiffToGradientMatrix(autodiff_xdot_vec);
-                        A = AB.leftCols(num_states);
-                        B = AB.rightCols(num_inputs);
-
-                        const Eigen::VectorXd xdot0 =
-                                math::autoDiffToValueMatrix(autodiff_xdot_vec);
-
-                        // todo: check equilibrium
-                        /*if (equilibrium_check_tolerance &&
-                            !xdot0.isZero(*equilibrium_check_tolerance)) {
-                            throw std::runtime_error(
-                                    "The nominal operating point (x0,u0) is not an equilibrium point "
-                                    "of "
-                                    "the system.  Without additional information, a time-invariant "
-                                    "linearization of this system is not well defined.");
-                        }*/
-
-                        f0 = xdot0 - A * x0 - B * u0;
-
-                        Eigen::MatrixXd C = Eigen::MatrixXd::Zero(num_outputs, num_states);
-                        Eigen::MatrixXd D = Eigen::MatrixXd::Zero(num_outputs, num_inputs);
-                        Eigen::VectorXd y0 = Eigen::VectorXd::Zero(num_outputs);
-
-                        const auto& autodiff_y0 = output_port->Eval(*autodiff_context);
-                        const Eigen::MatrixXd CD = math::autoDiffToGradientMatrix(autodiff_y0);
-                        C = CD.leftCols(num_states);
-                        D = CD.rightCols(num_inputs);
-
-                        const Eigen::VectorXd y = math::autoDiffToValueMatrix(autodiff_y0);
-
-                        // Note: No tolerance check needed here.  We have defined that the output
-                        // for the system produced by Linearize is in the coordinates (y-y0).
-
-                        y0 = y - C * x0 - D * u0;
-
-                        return std::make_unique<AffineSystem<double>>(A, B, f0, C, D, y0);
-                    }
-
-                    std::unique_ptr<AffineSystem<double>> Linearize(const double& t,
-                            variant<InputPortSelection, InputPortIndex> input_port_index = InputPortSelection::kUseFirstInputIfItExists,
-                            variant<OutputPortSelection, OutputPortIndex> output_port_index = OutputPortSelection::kUseFirstOutputIfItExists
-                    ) const{
-                        const Eigen::VectorXd x0 =  x_des.value(t);
-                        const Eigen::VectorXd u0 =  u_des.value(t);
-                        return Linearize(system, context,x0,u0,input_port_index, output_port_index);
-                    }
-
-
                 };
-
             };
+
+        }
+        namespace scalar_conversion {
+            template <>
+            struct Traits<controllers::TimeVaryingLQR> : public NonSymbolicTraits {};
         }
     }
 }
+

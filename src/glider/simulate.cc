@@ -15,36 +15,25 @@
 #include "iostream"
 #include "fstream"
 
-// taken from : https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/runDircolPerching.m
-
-
 namespace drake {
+    using systems::DiagramBuilder;
+    using systems::Simulator;
+    using systems::Context;
+    using systems::ContinuousState;
+    using systems::VectorBase;
+    using systems::controllers::TimeVaryingLQR;
+
     namespace examples {
         namespace glider {
             typedef trajectories::PiecewisePolynomial<double> PPoly;
             typedef std::pair<PPoly, PPoly> TrajPair;
-
             namespace {
-                template <typename T>
-                void dump(T& obj, const std::string& fname);
 
-                template <typename T>
-                bool load(T& obj, const std::string& fname);
-
-                void lqr_stabilize(const Glider<double>* glider, const systems::Context<double>& context, PPoly x_des, PPoly u_des);
-
-                void run_dircol(TrajPair& trajs, bool force_refresh=false) {
-                    const std::string traj_file_name = "trajs.bin";
-                    //auto trajs = std::make_unique<TrajPair>();
-                    if(!force_refresh && load(trajs,traj_file_name))
-                        return;
-
-                    systems::DiagramBuilder<double> builder;
-                    auto glider = std::make_unique<Glider<double>>();
-                    //Glider<double> glider;
-                    glider->set_name("glider");
-                    auto context = glider->CreateDefaultContext();
-
+                /*
+                 * ref:
+                 * https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/runDircolPerching.m
+                 */
+                TrajPair run_dircol(const Glider<double>& glider) {
                     const int kNumTimeSamples = 41;
                     const double kMinimumTimeStep = 0.01, kMaximumTimeStep = 2;
 
@@ -70,8 +59,9 @@ namespace drake {
 
                     const double R = 100;
 
+                    auto context = glider.CreateDefaultContext();
                     systems::trajectory_optimization::DirectCollocation dircol(
-                            glider.get(), *context, kNumTimeSamples, kMinimumTimeStep, kMaximumTimeStep);
+                            &glider, *context, kNumTimeSamples, kMinimumTimeStep, kMaximumTimeStep);
 
                     dircol.AddEqualTimeIntervalsConstraints();
 
@@ -122,131 +112,77 @@ namespace drake {
                     PPoly x_des = dircol.ReconstructStateTrajectory(result);
                     PPoly u_des = dircol.ReconstructInputTrajectory(result);
 
-                    lqr_stabilize(glider.get(), *context, x_des, u_des);
-
-                    dump(trajs, traj_file_name);
-                    std::cout<<"trajectories dumped to file: "<<traj_file_name<<std::endl;
-
-
-
-                    //return trajs;
-/*                    PPoly* x_des = &trajs.first;
-
-                    //drake::manipulation::PiecewiseCubicTrajectory<double> pc_traj(pp_xtraj);
-                    for(auto time: x_des->get_segment_times()){
-                        auto x = x_des->value(time);
-                        std::cerr<<x_des->get_segment_index(time)<<"\t"<<time<<"\t"<<x(0)<<"\t"<<x(1)<<std::endl;
-                    }*/
-
+                    return TrajPair(x_des, u_des);
                 }
 
-                template <typename T>
-                void dump(T& obj, const std::string& fname){
-                    std::ofstream file(fname, std::ios::out | std::ios::binary);
-                    file.write((char*)&obj, sizeof(obj));
-                    file.close();
+                /*
+                 * ref:
+                 * https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/runLQR.m
+                 * https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/GliderLQR.m
+                 * quadrotor_plant.cc
+                 */
+                std::unique_ptr<drake::systems::controllers::TimeVaryingLQR<double>> StabilizingLQRController(
+                const Glider<double>* glider, const PPoly& x_des,const PPoly& u_des){
+                    const MatrixX<double> Qf{(VectorX<double>(7) << 1/0.0025, 1/0.0025, 1/9.0, 1/9.0, 1, 1, 1/9.0).finished().asDiagonal()};
+                    const MatrixX<double> Q{(VectorX<double>(7) << 10,10,10,1,1,1,1).finished().asDiagonal()};
+                    const MatrixX<double> R{(MatrixX<double>(1,1) << 0.1).finished()};
+
+                    // auto tvlqr_context = glider->CreateDefaultContext();
+                    return std::make_unique<TimeVaryingLQR<double>>(*glider, x_des, u_des, Q, R, Qf);
                 }
 
-                // returns fileExists?
-                template <typename T>
-                bool load(T& obj, const std::string& fname){
-                    std::ifstream file(fname, std::ios::in | std::ios::binary);
-                    if(!file.is_open())
-                        return false;
-                    std::cout<<"read "<< sizeof(T)<<" chars"<<std::endl;
-                    file.read((char*)&obj, sizeof(obj));
-                    file.close();
-                    return true;
-                }
-                void lqr_stabilize(const Glider<double>* glider, const systems::Context<double>& context,const PPoly& x_des,const PPoly& u_des){
-                    VectorX<double> qf(7);
-                    qf << 1/0.0025, 1/0.0025, 1/9.0, 1/9.0, 1, 1, 1/9.0;
-                    MatrixX<double> Qf = qf.asDiagonal();
+                void simulate(const PPoly& x_des,const PPoly& u_des){
+                    DiagramBuilder<double> builder;
 
-                    VectorX<double> q(7);
-                    q << 10,10,10,1,1,1,1;
-                    Eigen::MatrixXd Q(7,7);
-                    Q = q.asDiagonal();
-                    Eigen::MatrixXd R(1,1);
-                    R << 0.1;
-
-                    auto tvlqr = systems::controllers::TimeVaryingLQR(*glider, context, x_des, u_des, Q, R, Qf);
-                    tvlqr.CalcControl();
-                    return;
-                }
-
-                // taken from: https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/runLQR.m
-                // and https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/GliderLQR.m
-/*                int run_lqr(){
-                    // u_traj and x_traj should be avail.
-                    systems::DiagramBuilder<double> builder;
-                    auto glider = std::make_unique<Glider<double>>();
-                    //Glider<double> glider;
+                    auto glider = builder.AddSystem(std::make_unique<Glider<double>>());
                     glider->set_name("glider");
-                    auto context = glider->CreateDefaultContext();
 
-                    VectorX<double> qf(7);
-                    qf << 1/0.0025, 1/0.0025, 1/9.0, 1/9.0, 1, 1, 1/9.0;
-                    MatrixX<double> Qf = qf.asDiagonal();
+                    auto controller = builder.AddSystem(StabilizingLQRController(
+                            glider, x_des, u_des));
+                    controller->set_name("controller");
 
-                    VectorX<double> q(7);
-                    q << 10,10,10,1,1,1,1;
-                    Eigen::MatrixXd Q(7,7);
-                    Q = q.asDiagonal();
-                    Eigen::MatrixXd R(1,1);
-                    R << 0.1;
-                    const double timePeriod = 0.01, timeHorizon = 1;
-                    systems::controllers::LinearModelPredictiveController<double> lmpc(glider.get(),*context, Q, R, timePeriod, timeHorizon);
-                    auto controller = builder.AddSystem(lmpc);
-                }*/
+                    builder.Connect(glider->get_output_port(0), controller->get_input_port());
+                    builder.Connect(controller->get_output_port(), glider->get_input_port(0));
+
+                    auto diagram = builder.Build();
+                    Simulator<double> simulator(*diagram);
+
+                    const VectorX<double> kXi0(x_des.value(0));
+                    simulator.get_mutable_context()
+                            .get_mutable_continuous_state_vector()
+                            .SetFromVector(kXi0);
+
+                    simulator.Initialize();
+
+                    const double kTimeSpan(x_des.end_time());
+                    simulator.AdvanceTo(kTimeSpan);
+
+                    const Context<double>& sim_context = simulator.get_context();
+                    const VectorX<double>& Xf(sim_context.get_continuous_state_vector());
+
+                    const VectorX<double> kXf0(x_des.value(x_des.end_time()));
+
+                    std::cout<<"Final state is off by: "<<(Xf - kXf0).norm()<<std::endl;
+                }
+
+                /*
+                 * tutorial on unique_ptr: https://thispointer.com/c11-unique_ptr-tutorial-and-examples/
+                 */
+                void do_main(){
+                    Glider<double> glider;;
+                    glider.set_name("glider");
+
+                    // get optimal state and input trajectories to reach goal
+                    auto tr_des = run_dircol(glider);
+
+                    simulate(tr_des.first, tr_des.second);
+                }
             }
 
         }
     }
 }
 
-/*
-namespace drake{
-    namespace systems{
-        namespace controllers{
-            /// The return type of ConnectController.
-            template <typename T>
-            struct ConnectResult {
-                /// The feed forward control input.
-                const InputPort<T>& control_input_port;
-                /// The feedback state input.
-                const InputPort<T>& state_input_port;
-            };
-
-            template <typename T>
-            static ConnectResult<T> ConnectController(
-                    const InputPort<T>& plant_input,
-                    const OutputPort<T>& plant_output,
-                    const MatrixX<double>& feedback_selector, const Eigen::VectorXd& Kp,
-                    const Eigen::VectorXd& Ki, const Eigen::VectorXd& Kd,
-                    DiagramBuilder<T>* builder) {
-                auto controller = builder->template AddSystem<PidController<T>>(
-                        feedback_selector,
-                                Kp, Ki, Kd);
-
-                auto plant_input_adder =
-                builder->template AddSystem<Adder<T>>(2, plant_input.size());
-
-                builder->Connect(plant_output, controller->get_input_port_estimated_state());
-                builder->Connect(controller->get_output_port_control(),
-                                 plant_input_adder->get_input_port(0));
-                builder->Connect(plant_input_adder->get_output_port(), plant_input);
-
-                return ConnectResult<T>{
-                        plant_input_adder->get_input_port(1),
-                        controller->get_input_port_desired_state()};
-            }
-
-            }
-
-    }
-}
-*/
 
 
 int main(int argc, char *argv[]) {
@@ -254,8 +190,6 @@ int main(int argc, char *argv[]) {
             "Trajectory optimization for perching glider.");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     drake::logging::HandleSpdlogGflags();
-    drake::examples::glider::TrajPair trajs;
-    drake::examples::glider::run_dircol(trajs, true);
-//    drake::examples::glider::run_dircol(trajs);
+    drake::examples::glider::do_main();
     return 0;
 }
