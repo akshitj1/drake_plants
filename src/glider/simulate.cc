@@ -7,13 +7,7 @@
 #include "drake/common/trajectories/piecewise_polynomial.h"
 #include "drake/solvers/solve.h"
 #include "limits"
-#include "drake/manipulation/util/trajectory_utils.h"
-#include "drake/systems/primitives/trajectory_source.h"
-#include "drake/systems/primitives/adder.h"
-#include "drake/systems/controllers/linear_model_predictive_controller.h"
 #include "tvlqr.h"
-#include "iostream"
-#include "fstream"
 
 namespace drake {
     using systems::DiagramBuilder;
@@ -117,18 +111,19 @@ namespace drake {
 
                 /*
                  * ref:
+                 * https://groups.csail.mit.edu/robotics-center/public_papers/Moore14a.pdf
                  * https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/runLQR.m
                  * https://github.com/RobotLocomotion/drake/blob/last_sha_with_original_matlab/drake/examples/Glider/GliderLQR.m
                  * quadrotor_plant.cc
                  */
-                std::unique_ptr<drake::systems::controllers::TimeVaryingLQR<double>> StabilizingLQRController(
+                std::unique_ptr<drake::systems::controllers::TimeVaryingLQR> StabilizingLQRController(
                 const Glider<double>* glider, const PPoly& x_des,const PPoly& u_des){
-                    const MatrixX<double> Qf{(VectorX<double>(7) << 1/0.0025, 1/0.0025, 1/9.0, 1/9.0, 1, 1, 1/9.0).finished().asDiagonal()};
+                    const VectorX<double> kXf_err_max{(VectorX<double>(7) << 0.05,0.05,3,3,1,1,3).finished()};
+                    const MatrixX<double> Qf{kXf_err_max.array().square().inverse().matrix().asDiagonal()};
                     const MatrixX<double> Q{(VectorX<double>(7) << 10,10,10,1,1,1,1).finished().asDiagonal()};
                     const MatrixX<double> R{(MatrixX<double>(1,1) << 0.1).finished()};
 
-                    // auto tvlqr_context = glider->CreateDefaultContext();
-                    return std::make_unique<TimeVaryingLQR<double>>(*glider, x_des, u_des, Q, R, Qf);
+                    return std::make_unique<TimeVaryingLQR>(*glider, x_des, u_des, Q, R, Qf);
                 }
 
                 void simulate(const PPoly& x_des,const PPoly& u_des){
@@ -148,9 +143,12 @@ namespace drake {
                     Simulator<double> simulator(*diagram);
 
                     const VectorX<double> kXi0(x_des.value(0));
+                    // this is the actual initial state which is deviated from desired one
+                    const VectorX<double> kXi(kXi0 + (VectorX<double>(7) << 0,0,0,0, 0, 4, 0).finished());
+
                     simulator.get_mutable_context()
                             .get_mutable_continuous_state_vector()
-                            .SetFromVector(kXi0);
+                            .SetFromVector(kXi);
 
                     simulator.Initialize();
 
@@ -158,11 +156,22 @@ namespace drake {
                     simulator.AdvanceTo(kTimeSpan);
 
                     const Context<double>& sim_context = simulator.get_context();
-                    const VectorX<double>& Xf(sim_context.get_continuous_state_vector());
+                    const VectorX<double>& Xf(sim_context.get_continuous_state_vector().CopyToVector());
 
                     const VectorX<double> kXf0(x_des.value(x_des.end_time()));
 
-                    std::cout<<"Final state is off by: "<<(Xf - kXf0).norm()<<std::endl;
+                    const VectorX<double> xf_err((Xf - kXf0).cwiseAbs());
+
+                    drake::log()->info("\nXf-des: \t\t{}\nXf-actual: \t\t{}\nXf-error: \t\t{}\n||error||: \t\t{}",
+                                       kXf0.transpose(),
+                                       Xf.transpose(),
+                                       xf_err.transpose(),
+                                       (Xf - kXf0).norm()
+                                       );
+
+                    // todo: redefined here. remove and assert for all vector coeffecients positive
+                    const VectorX<double> kXf_err_max{(VectorX<double>(7) << 0.05,0.05,3,3,1,1,3).finished()};
+                    DRAKE_ASSERT(xf_err.isMuchSmallerThan(kXf_err_max,1.0));
                 }
 
                 /*

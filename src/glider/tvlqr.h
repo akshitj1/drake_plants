@@ -15,11 +15,10 @@
 #include "drake/common/default_scalars.h"
 
 
-
 namespace drake {
     namespace systems {
         namespace controllers {
-            template <typename T>
+            template<typename T>
             using PPoly = trajectories::PiecewisePolynomial<T>;
             /*
              * ref:
@@ -30,8 +29,8 @@ namespace drake {
              */
 
             // util functions
-            template <typename T>
-            static std::unique_ptr<AffineSystem<T>> Linearize(const System<T> &system,
+            template<typename T>
+            static std::unique_ptr<AffineSystem<double>> Linearize(const System<T> &system,
                                                                    const VectorX<T> &x0,
                                                                    const VectorX<T> &u0) {
                 auto lin_context = system.CreateDefaultContext();
@@ -44,7 +43,7 @@ namespace drake {
                 return affine_system;
             }
 
-            template <typename T>
+            template<typename T>
             static MatrixX<double> unravel(VectorX<T> &x, const int kDim) {
                 MatrixX<T> X(kDim, kDim);
                 // kDim can be derived from x.size() also as square
@@ -52,22 +51,22 @@ namespace drake {
                 return X;
             }
 
-            template <typename T>
+            template<typename T>
             static VectorX<double> ravel(MatrixX<T> &X) {
                 return Eigen::Map<VectorX<T>>(X.data(), X.size());
             }
 
-
-            template<typename T>
-            class TimeVaryingLQR final : public LeafSystem<T> {
+            // todo: change return type to TimeVaryingAffineSystem as LinearQuadraticRegulator returns AffineSystem
+            class TimeVaryingLQR final : public LeafSystem<double> {
             public:
                 DRAKE_NO_COPY_NO_MOVE_NO_ASSIGN(TimeVaryingLQR);
 
             private:
-                const MatrixX<T> &Q, Qf, R;
-                const System<T> &system;
-                const PPoly<T>& x_des;
-                const PPoly<T>& u_des;
+                const MatrixX<double> &Q, Qf, R;
+                const System<double> &system;
+                // todo: replace by input ports for state and input trajectory ref: PidController
+                const PPoly<double> &x_des;
+                const PPoly<double> &u_des;
                 const int kNumStates, kNumInputs;
                 const double kTimeSpan;
 
@@ -77,18 +76,17 @@ namespace drake {
                 std::unique_ptr<DenseOutput<double>> s_traj;
             public:
                 TimeVaryingLQR(
-                        const System<T> &_system,
-                        const PPoly<T> &_x_des,
-                        const PPoly<T> &_u_des,
-                        const MatrixX<T> &_Q,
-                        const MatrixX<T> &_R,
-                        const MatrixX<T> &_Qf) :
-                        LeafSystem<T>(SystemTypeTag<TimeVaryingLQR>{}),
-                                      system(_system), Q(_Q), Qf(_Qf), R(_R), x_des(_x_des),
-                                      u_des(_u_des),
-                                      kTimeSpan(_x_des.end_time()), kNumStates(_Q.rows()), kNumInputs(_R.rows()) {
+                        const System<double> &_system,
+                        const PPoly<double> &_x_des,
+                        const PPoly<double> &_u_des,
+                        const MatrixX<double> &_Q,
+                        const MatrixX<double> &_R,
+                        const MatrixX<double> &_Qf) :
+                        system(_system), Q(_Q), Qf(_Qf), R(_R), x_des(_x_des),
+                        u_des(_u_des),
+                        kTimeSpan(_x_des.end_time()), kNumStates(_Q.rows()), kNumInputs(_R.rows()) {
 
-                    Eigen::LLT<MatrixX<T>> R_cholesky(R);
+                    Eigen::LLT<MatrixX<double>> R_cholesky(R);
                     if (R_cholesky.info() != Eigen::Success) {
                         throw std::runtime_error("R must be positive definite");
                     }
@@ -96,9 +94,10 @@ namespace drake {
 
                     //this->DeclareContinuousState(kNumInputs);
 
-                    output_index_control_ = this->DeclareVectorOutputPort(
-                            BasicVector<T>(kNumInputs),
-                            &TimeVaryingLQR<T>::CalcControl
+                    output_index_control_ = this->DeclareVectorOutputPort("corrected_control",
+                                                                          BasicVector<double>(kNumInputs),
+                                                                          &TimeVaryingLQR::CalcControl,
+                                                                          {this->all_state_ticket()}
                     ).get_index();
 
                     input_index_state_ = this->DeclareInputPort(kVectorValued, kNumStates).get_index();
@@ -106,82 +105,89 @@ namespace drake {
                     computeSTrajectory();
                 }
 
-/*
-                template <typename U>
+
+/*                template <typename U>
                 TimeVaryingLQR(const TimeVaryingLQR<U>& other)
-                        : TimeVaryingLQR(other.system, other.x_des, other.u_des, other.Q, other.R, other.Qf) {}
-*/
+                        : TimeVaryingLQR(other.system, other.x_des, other.u_des, other.Q, other.R, other.Qf) {}*/
 
 
                 /**
                  * Returns the output port for computed control.
                  */
-                const OutputPort<T> &get_output_port() const {
-                    return System<T>::get_output_port(output_index_control_);
+                const OutputPort<double> &get_output_port() const {
+                    return System<double>::get_output_port(output_index_control_);
                 }
 
                 /**
                  * Returns the input port for the estimated state.
                  */
-                const InputPort<T>& get_input_port() const {
-                    return System<T>::get_input_port(input_index_state_);
+                const InputPort<double> &get_input_port() const {
+                    return System<double>::get_input_port(input_index_state_);
                 }
 
-                void DoCalcTimeDerivatives(const systems::Context<T>& context,
-                                           systems::ContinuousState<T> *derivatives) const override {}
+/*
+                // todo: implement this
+                void DoCalcTimeDerivatives(const systems::Context<double>& context,
+                                           systems::ContinuousState<double> *derivatives) const override {}
+*/
 
 
-                    private:
-                T revTime(const T& t) const{
+            private:
+                double revTime(const double &t) const {
                     return revTime(t, kTimeSpan);
                 }
 
-                static T revTime(const T& t, const T& kTimeSpan) {
-                    return std::max<T>(0.0, kTimeSpan - t);
+                static double revTime(const double &t, const double &kTimeSpan) {
+                    return std::max<double>(0.0, kTimeSpan - t);
                 }
 
 
             public:
-                void CalcControl(const Context<T> &context,
-                                                   BasicVector<T> *control) const {
-                    const Eigen::VectorBlock<const VectorX<T>> x = get_input_port().Eval(context);
-                    const T& t = context.get_time();
-                    const VectorX<T> x0 = x_des.value(t);
+                void CalcControl(const Context<double> &context,
+                                 BasicVector<double> *control) const {
+                    const Eigen::VectorBlock<const VectorX<double>> x = get_input_port().Eval(context);
+                    const double &t = context.get_time();
+                    const VectorX<double> x0 = x_des.value(t);
                     // State error.
-                    const VectorX<T> x_bar = x - x0;
+                    const VectorX<double> x_bar = x - x0;
 
-                    const T rev_t = this->revTime(t);
+                    const double rev_t = this->revTime(t);
                     VectorX<double> s = s_traj->Evaluate(rev_t);
                     MatrixX<double> S = unravel(s, kNumStates);
 
-                    auto affine_system = Linearize<T>(system, x_des.value(t), u_des.value(t));
+                    auto affine_system = Linearize<double>(system, x_des.value(t), u_des.value(t));
 
-                    VectorX<double> u_delta = -R.inverse() * affine_system->B().transpose() * S * x_bar;
+                    auto K = R.inverse() * affine_system->B().transpose() * S;
+                    VectorX<double> u_delta = -K * x_bar;
+
+                            SPDLOG_DEBUG(drake::log(), "time : {}\tu_des : {}\tu_delta : {}", t, u_des.value(t),
+                                         u_delta);
 
                     control->SetFromVector(u_des.value(t) + u_delta);
                 }
-                private:
+
+            private:
 
                 void computeSTrajectory() {
                     // PPoly xdot_traj = x_des.derivative();
-                    MatrixX<T> S_f = Qf;
-                    VectorX<T> kDefaultInitialState = ravel(S_f);
-                    const T kDefaultInitialTime = 0.0;
-                    VectorX<T> kDefaultParams(0);
+                    MatrixX<double> S_f = Qf;
+                    VectorX<double> kDefaultInitialState = ravel(S_f);
+                    const double kDefaultInitialTime = 0.0;
+                    VectorX<double> kDefaultParams(0);
 
-                    // todo: why typename?
-                    const typename InitialValueProblem<T>::SpecifiedValues kDefaultValues(
+                    const InitialValueProblem<double>::SpecifiedValues kDefaultValues(
                             kDefaultInitialTime, kDefaultInitialState, kDefaultParams
                     );
 
-                    InitialValueProblem<T> ivp(sDot(system, Q, R, x_des, u_des), kDefaultValues);
+                    InitialValueProblem<double> ivp(sDot<double>(system, Q, R, x_des, u_des), kDefaultValues);
                     //VectorX<double> s_cur = ivp.Solve(kTimeSpan);
                     s_traj = ivp.DenseSolve(kTimeSpan);
                     //debugRes();
                 }
 
             private:
-
+                    // todo: Should we use lambda instead? trade-off between readability and compactness
+                template<typename T>
                 class sDot {
                 private:
                     const MatrixX<T> &Q, R;
@@ -219,19 +225,18 @@ namespace drake {
                         const MatrixX<T> B = affine_system->B();
                         const MatrixX<T> Ri = R.inverse();
 
-                        // todo: handle sign
+                        // sign is changed as we are converting backward to forward integration
                         Sdot = S * A + A.transpose() * S - S * B * Ri * B.transpose() * S + Q;
                         VectorX<T> sdot = ravel(Sdot);
                         return sdot;
                     }
                 };
             };
-
         }
-        namespace scalar_conversion {
+/*        namespace scalar_conversion {
             template <>
             struct Traits<controllers::TimeVaryingLQR> : public NonSymbolicTraits {};
-        }
+        }*/
     }
 }
 
