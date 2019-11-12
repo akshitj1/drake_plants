@@ -31,3 +31,5 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 add_subdirectory(glider)
+# add_subdirectory(control)
+add_subdirectory(analysis)

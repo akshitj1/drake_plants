@@ -9,6 +9,7 @@ target_link_libraries(tvlqr drake::drake)
 add_executable(simulate_glider simulate.cc)
 target_link_libraries(simulate_glider glider tvlqr drake::drake-common-text-logging-gflags gflags_shared)
 
+
 #add_test(NAME simulate
 #        COMMAND simulate
 #        )
